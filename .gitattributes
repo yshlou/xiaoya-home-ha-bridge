@@ -1,0 +1,10 @@
+* text=auto
+*.c text
+*.h text
+*.md text
+*.yml text
+*.yaml text
+*.py text
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sh text eol=lf

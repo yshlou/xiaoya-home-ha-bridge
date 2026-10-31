@@ -1,0 +1,32 @@
+name: build-xbridge
+
+on:
+  push:
+    paths: ['bridge/**']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build aarch64 static
+        working-directory: bridge
+        run: zig cc -target aarch64-linux-musl -O2 -DHAVE_MINIMP3 -static -s -o xbridge xbridge.c
+
+      - name: Smoke test (host build + run probe arg)
+        working-directory: bridge
+        run: |
+          zig cc -target x86_64-linux-musl -O2 -DHAVE_MINIMP3 -static -s -o xbridge_test xbridge.c
+          ./xbridge_test -h | head -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xbridge-aarch64
+          path: bridge/xbridge

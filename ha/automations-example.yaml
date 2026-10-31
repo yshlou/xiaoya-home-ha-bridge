@@ -1,0 +1,54 @@
+# 小雅HOME 实体按键自动化示例
+# 用法：并入 HA 的 automations.yaml（或改成 package 包含）。
+# 按键 code 因设备/固件而异：先用 `xbridge -probe` 实测，再替换下面的 164 / 114 / 115。
+# 音量实体 ID 按你的 HA 自动生成的 slug 修改（MQTT number 实体，名称"音量"）。
+# 写入后无需重启 HA：开发者工具 → YAML → 重新加载自动化。
+
+- id: xiaoya_btn_playpause
+  alias: 小雅音箱 播放暂停键
+  description: 实体按键 code=164 -> toggle 播放/暂停
+  trigger:
+    - platform: mqtt
+      topic: xiaoya/event/button
+      value_template: "{{ value_json.code ~ '/' ~ value_json.value }}"
+  condition:
+    - condition: template
+      value_template: "{{ trigger.payload_json.code == 164 and trigger.payload_json.value == 1 }}"
+  action:
+    - service: mqtt.publish
+      data:
+        topic: xiaoya/cmd/media
+        payload: toggle
+  mode: single
+
+- id: xiaoya_btn_vol_down
+  alias: 小雅音箱 音量减键
+  description: 实体按键 code=114 -> 音量 -5
+  trigger:
+    - platform: mqtt
+      topic: xiaoya/event/button
+  condition:
+    - condition: template
+      value_template: "{{ trigger.payload_json.code == 114 and trigger.payload_json.value == 1 }}"
+  action:
+    - service: mqtt.publish
+      data:
+        topic: xiaoya/cmd/volume
+        payload_template: "{{ [states('number.xiao_ya_home_yin_liang') | int(20) - 5, 0] | max }}"
+  mode: single
+
+- id: xiaoya_btn_vol_up
+  alias: 小雅音箱 音量加键
+  description: 实体按键 code=115 -> 音量 +5
+  trigger:
+    - platform: mqtt
+      topic: xiaoya/event/button
+  condition:
+    - condition: template
+      value_template: "{{ trigger.payload_json.code == 115 and trigger.payload_json.value == 1 }}"
+  action:
+    - service: mqtt.publish
+      data:
+        topic: xiaoya/cmd/volume
+        payload_template: "{{ [states('number.xiao_ya_home_yin_liang') | int(20) + 5, 100] | min }}"
+  mode: single

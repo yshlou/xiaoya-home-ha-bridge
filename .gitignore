@@ -1,0 +1,9 @@
+# 编译产物
+bridge/xbridge
+bridge/xbridge_test
+*.o
+*.log
+
+# 编辑器
+.vscode/
+.idea/
