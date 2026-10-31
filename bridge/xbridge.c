@@ -10,6 +10,8 @@
  *           cmd/exec（默认关闭，-e 开启）
  *   - 歌单：-l 指定音乐目录 HTTP 列表页，支持上一曲/下一曲/播完自动连播/曲目上报
  *   - 按键：直接读 /dev/input/event*，发布到 event/button（不影响 XYOS 同时读取）
+ *   - 状态自愈：每 60s 重发 available/音量/播放状态/曲目（均 retain），
+ *     任何一端断线重连错过消息时自动恢复，实体不再卡“不可用”
  *   - 音频：minimp3 解码 MP3 / 自解析 WAV 头 → 管道喂给 aplay（走 asound.conf 的路由）
  *
  * 编译（见 build.cmd / build.yml）：
@@ -742,10 +744,12 @@ static void *playback_thread(void *arg)
 /* ---------------- 音量 ---------------- */
 /* 注意：本机 amixer 的 sset 找不到 softvol 控件，必须用 cset name=...；
  * Master Playback Volume 实际量程 0-99，把 0-100% 映射过去。 */
+static int g_volpct = -1;                /* 最近设置的音量百分比，-1 = 尚未设置 */
 static void set_volume(int pct)
 {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
+    g_volpct = pct;
     int raw = pct * 99 / 100;
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
@@ -866,11 +870,28 @@ static void publish_online_and_discovery(void)
     publish_track();
 }
 
+/* 周期状态刷新：MQTT 保留消息只对新订阅会话重放；若 HA 在某条消息发出的
+ * 瞬间恰好重连，会错过该消息（曾导致实体卡在“不可用”）。每 60s 把全部
+ * 状态重发一遍（均带 retain），任何一端断线重连后 1 分钟内自愈。 */
+static void publish_state_refresh(void)
+{
+    mqtt_publish(T_STATE_AVAIL, "online", 1);
+    mqtt_publish(T_STATE_PB,
+                 g_pbstate == 1 ? "playing" : (g_pbstate == 2 ? "paused" : "idle"), 1);
+    if (g_volpct >= 0) {
+        char s[8];
+        snprintf(s, sizeof(s), "%d", g_volpct);
+        mqtt_publish(T_STATE_VOL, s, 1);
+    }
+    publish_track();
+}
+
 static void *net_thread(void *arg)
 {
     (void)arg;
     int backoff = 2;
     time_t last_ping = 0;
+    time_t last_state = 0;
     while (g_run) {
         int fd = tcp_connect_host(g_broker, g_port);
         if (fd < 0) {
@@ -901,6 +922,7 @@ static void *net_thread(void *arg)
         mqtt_send_subscribe(fd, T_CMD_MEDIA);
         if (g_allow_exec) mqtt_send_subscribe(fd, T_CMD_EXEC);
         last_ping = time(NULL);
+        last_state = time(NULL);
 
         /* 读取循环 */
         int alive = 1;
@@ -912,6 +934,11 @@ static void *net_thread(void *arg)
                 if (time(NULL) - last_ping >= 25) {
                     if (mqtt_send_ping(fd) != 0) break;
                     last_ping = time(NULL);
+                }
+                if (time(NULL) - last_state >= 60) {
+                    publish_state_refresh();
+                    if (g_verbose) logmsg("状态周期重发(60s)");
+                    last_state = time(NULL);
                 }
                 continue;
             }

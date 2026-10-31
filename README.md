@@ -13,6 +13,8 @@
 - **本地播放**：minimp3 解码 MP3、自解析 WAV 头，管道喂 `aplay`，走 ALSA loopback 与原厂 XYOS 混音共存
 - **NAS 歌单**：`-l` 指定音乐目录的 HTTP 列表页，即得上/下一曲、播完自动连播、当前曲目上报
 - **实体按键**：读取 `/dev/input/event*`，把按键广播到 `xiaoya/event/button`，与原厂 XYOS 互不干扰
+- **状态自愈**：每 60s 周期重发 available / 音量 / 播放状态 / 曲目（均 retain），任何一端断线重连
+  错过消息时自动恢复，HA 实体不再卡「不可用」
 - **TTS/电台**：`cmd/tts` / `cmd/play` 播放任意局域网 MP3/WAV/电台流 URL
 - **体积**：aarch64 musl 静态单文件约 160 KB，音箱侧零依赖
 
