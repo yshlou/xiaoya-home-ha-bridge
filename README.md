@@ -42,10 +42,11 @@
 | `bridge/build.cmd` | Windows 本地交叉编译脚本（zig cc） |
 | `.github/workflows/build-xbridge.yml` | GitHub Actions 云端编译，Artifacts 直接下载二进制 |
 | `docs/deploy.md` | 完整部署手册（前置验证 / 部署 / 开机自启 / 按键 / TTS / 歌单 / 排错） |
+| `docs/wan-block.md` | 无 iptables 固件的内核级断外网方案（路由层 egress block，可逆/幂等/开机自启） |
 | `ha/automations-example.yaml` | 实体按键 → 播放控制/音量的 3 条自动化示例 |
 | `nas/gen_index.py` | 为 busybox httpd 音乐目录生成 index.html（busybox 无目录列表，必需） |
 | `nas/music-httpd-start.sh` | NAS 上把音乐目录发布到 HTTP 的启动脚本 |
-| `speaker/auto_reboot.sh` | 音箱开机自启钩子模板（写入 `/userdata/cfg/rockchip_test/`） |
+| `speaker/auto_reboot.sh` | 音箱开机自启钩子模板（写入 `/userdata/cfg/rockchip_test/`，含可选 WAN block 段） |
 
 ## 快速开始
 
