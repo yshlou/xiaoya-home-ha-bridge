@@ -10,8 +10,9 @@
  *           cmd/exec（默认关闭，-e 开启）
  *   - 歌单：-l 指定音乐目录 HTTP 列表页，支持上一曲/下一曲/播完自动连播/曲目上报
  *   - 按键：直接读 /dev/input/event*，发布到 event/button（不影响 XYOS 同时读取）
- *   - 状态自愈：每 60s 重发 available/音量/播放状态/曲目（均 retain），
- *     任何一端断线重连错过消息时自动恢复，实体不再卡“不可用”
+ *   - 状态自愈：每 60s 重发 available/音量/播放状态（均 retain），
+ *     任何一端断线重连错过消息时自动恢复，实体不再卡“不可用”；
+ *     曲目不周期重发（retain 已自愈，外部流播放时由代理按曲发布）
  *   - 音频：minimp3 解码 MP3 / 自解析 WAV 头 → 管道喂给 aplay（走 asound.conf 的路由）
  *
  * 编译（见 build.cmd / build.yml）：
@@ -871,8 +872,10 @@ static void publish_online_and_discovery(void)
 }
 
 /* 周期状态刷新：MQTT 保留消息只对新订阅会话重放；若 HA 在某条消息发出的
- * 瞬间恰好重连，会错过该消息（曾导致实体卡在“不可用”）。每 60s 把全部
- * 状态重发一遍（均带 retain），任何一端断线重连后 1 分钟内自愈。 */
+ * 瞬间恰好重连，会错过该消息（曾导致实体卡在“不可用”）。每 60s 重发
+ * available/音量/播放状态（均带 retain），任何一端断线重连后 1 分钟内自愈。
+ * 曲目（track）不在此重发：retain 本身已可自愈，且连播外部流（radar 代理）
+ * 时由代理按曲切换发布，周期重发会把显示拉回歌单曲目（2026-11-01 调整）。 */
 static void publish_state_refresh(void)
 {
     mqtt_publish(T_STATE_AVAIL, "online", 1);
@@ -883,7 +886,6 @@ static void publish_state_refresh(void)
         snprintf(s, sizeof(s), "%d", g_volpct);
         mqtt_publish(T_STATE_VOL, s, 1);
     }
-    publish_track();
 }
 
 static void *net_thread(void *arg)
