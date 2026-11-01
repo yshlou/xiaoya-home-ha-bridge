@@ -25,6 +25,51 @@
  *      flow control: we now wait for the client's OKAY before the next WRTE
  *      (await_ok), instead of blasting unacknowledged packets.
  *
+ * v1.2 fixes (defects found in production on 2026-10-31, evening):
+ *   4. Output truncation on fast-producing commands: the child-output loop
+ *      did read() FIRST and only then checked await_ok - bytes read while a
+ *      WRTE was still unacknowledged were silently discarded, so
+ *      "echo a; echo b; cat file" randomly lost everything after the first
+ *      block (slow output always survived: the OKAY arrived during the
+ *      sleep). await_ok is now checked BEFORE read(): data stays in the
+ *      pipe until the client acks.
+ *   5. Push hang / stdin data loss: client->us WRTE frames carry the
+ *      device-side stream id in a1 (a0 is ALWAYS the sender's own id), but
+ *      the lookup matched local_id == a0. That only worked while both
+ *      sides numbered streams in lockstep (fresh adb server: 1,1 2,2...);
+ *      once the adb server's ids drifted (ours 1, client 47) every client
+ *      WRTE missed its stream and was dropped after an accidental bare
+ *      OKAY ack -> sync frames vanished (push waited forever for a STAT
+ *      that never came) and stdin bytes never reached the child. Lookup
+ *      now matches local_id == a1, consistent with the OKAY/CLSE handlers.
+ *   6. SIGPIPE was at default disposition: writing stdin to a child that
+ *      had already exited raised SIGPIPE and killed the whole connection
+ *      handler. Now ignored; write_all() reports EPIPE and the stream is
+ *      closed cleanly.
+ *   7. LIST hardening: per-entry path buffer 1100 -> 1350 bytes
+ *      (spath 1023 + '/' + d_name 255).
+ *   8. CNXN max-data was announced as 4096, so adb clients refused any
+ *      shell command over ~4KB with "error: shell command too long" - the
+ *      64KB command buffer from v1.1 was unreachable. Now announces 64KB;
+ *      g_in doubled to 128KB to match.
+ *   9. sync frame accumulator was 8KB: a pushed file arrives as one DATA
+ *      frame fragmented across many WRTEs - anything over ~8KB would
+ *      overflow the accumulator and FAIL. Now 96KB (one full 64KB DATA
+ *      frame plus slack).
+ *  10. STAT on a missing path replied FAIL; adb clients abort the push
+ *      with "stat response has wrong message id" (they expect a STAT
+ *      reply with zeroed fields meaning "not exists", like real adbd).
+ *      Now replies STAT+zeros and continues.
+ *  11. The SEND/DONE ack was 4 bytes; this adb client reads the full
+ *      8-byte response header (id + size) and blocked forever missing the
+ *      last 4 (push finished but the client never exited). Now sends
+ *      OKAY + 4 zero bytes, matching real adbd.
+ *  12. sync DATA payloads are now streamed straight to disk instead of
+ *      being buffered until the whole frame arrives: this adb client
+ *      pipelines several 64KB WRTEs without waiting for per-packet acks,
+ *      so buffering whole frames overflowed any fixed buffer (200KB push
+ *      died with "sync buffer overflow").
+ *
  * Protocol recap (little endian, 24-byte header):
  *   cmd(4) arg0(4) arg1(4) data_len(4) data_checksum(4) magic(4)
  *   CNXN OPEN OKAY CLSE WRTE AUTH
@@ -69,6 +114,7 @@
 
 #define MAX_STREAMS 8
 #define MAXPAYLOAD 4096
+#define MAXPAYLOAD_IO (64 * 1024)  /* v1.2: CNXN 上报的最大包长。旧值 4096 会让 adb 客户端直接拒发长命令（"shell command too long"），64KB 命令缓冲形同虚设 */
 #define SYNC_CHUNK (MAXPAYLOAD - 32)   /* room for DATA/DENT frame headers */
 #define MAXCMD (64 * 1024)
 #define PROTO_VERSION 0x01000000
@@ -107,8 +153,12 @@ typedef struct {
     int sstate;           /* 0 idle, 1 SEND, 2 RECV, 3 LIST */
     int sfd;              /* file fd, -1 none */
     char spath[1024];
-    unsigned char sbuf[8192];   /* sync frame accumulator */
+    unsigned char sbuf[1104];  /* v1.2: 只存帧头+路径(≤8+1023)。DATA 帧负载不进缓冲、直接流写盘——该 adb 客户端会流水线连发多个 64KB WRTE，任何"整帧攒齐再落盘"的缓冲都会溢出 */
     size_t sfill;
+    unsigned sdata_remain;    /* v1.2: SEND 状态下当前 DATA 帧剩余待落盘字节数 */
+    unsigned sneed;           /* v1.2: 正在攒的帧还差多少字节才完整(8 或 8+路径长) */
+    unsigned char oq[16 * 1024];  /* v1.2: 待发帧队列——该客户端会流水线连发，我方 WRTE 未被 ack 时新回复先排队，OKAY 到达后按序冲刷 */
+    size_t oq_fill;
     DIR *dirp;
 } stream_t;
 
@@ -195,6 +245,12 @@ static int send_msg(int fd, unsigned cmd, unsigned a0, unsigned a1,
     unsigned magic = cmd ^ 0xffffffffu;
     memcpy(h, &magic, 4);
 
+    if (g_verbose) {
+        char c[5];
+        memcpy(c, &cmd, 4);
+        c[4] = 0;
+        logmsg("TX %s a0=%u a1=%u len=%u", c, a0, a1, (unsigned)len);
+    }
     if (write_all(fd, hdr, 24) < 0)
         return -1;
     if (len && write_all(fd, data, len) < 0)
@@ -202,15 +258,43 @@ static int send_msg(int fd, unsigned cmd, unsigned a0, unsigned a1,
     return 0;
 }
 
-/* 发送一个本流的数据 WRTE；每流同时只允许一个未确认 WRTE（await_ok 流控） */
+/* 发送一个本流的数据 WRTE；await_ok 流控 + 待发队列：
+ * 客户端流水线化（可能在我方上一包被 ack 前就发后续请求），
+ * 未确认时不能丢帧，排队等 OKAY 后冲刷。 */
 static int wrte_stream(int cfd, stream_t *s, const void *data, size_t len)
 {
-    if (s->await_ok)
-        return -1;
+    if (s->await_ok) {
+        if (s->oq_fill + len > sizeof(s->oq)) {
+            logmsg("wrte queue overflow (stream %u, %zu+%zu)",
+                   s->local_id, s->oq_fill, len);
+            return -1;
+        }
+        memcpy(s->oq + s->oq_fill, data, len);
+        s->oq_fill += len;
+        return 0;
+    }
     if (send_msg(cfd, A_WRTE, s->local_id, s->remote_id, data, len) < 0)
         return -1;
     s->await_ok = 1;
     return 0;
+}
+
+/* OKAY 到达后调用：按序冲刷待发队列（一次只发一包，发完若还有剩余则
+ * 继续等下一次 OKAY） */
+static void wrte_flush(int cfd, stream_t *s)
+{
+    while (s->oq_fill > 0) {
+        size_t n = s->oq_fill;
+        if (n > MAXPAYLOAD)
+            n = MAXPAYLOAD;
+        if (send_msg(cfd, A_WRTE, s->local_id, s->remote_id, s->oq, n) < 0)
+            return;
+        s->await_ok = 1;
+        memmove(s->oq, s->oq + n, s->oq_fill - n);
+        s->oq_fill -= n;
+        if (s->oq_fill > 0)
+            return;
+    }
 }
 
 /* ---------- command runner ---------- */
@@ -265,155 +349,215 @@ static void sync_fail(int cfd, stream_t *s, const char *msg)
     stream_close(s);
 }
 
-/* 消费 sync 流缓冲区里的完整帧；不完整则留在缓冲区等下一个 WRTE */
-static void sync_process(int cfd, stream_t *s)
-{
-    for (;;) {
-        if (s->sfill < 8)
-            return;
-        char id[5];
-        memcpy(id, s->sbuf, 4);
-        id[4] = 0;
-        unsigned arg;
-        memcpy(&arg, s->sbuf + 4, 4);
+/* v1.2: 前置声明：sync_input 的 RECV/LIST 分支会立即开始泵数据 */
+static void sync_pump(int cfd, stream_t *s);
 
-        if (!memcmp(id, "STAT", 4)) {
-            if (s->sfill < 8 + (size_t)arg)
-                return;
-            if (arg >= sizeof(s->spath)) {
-                sync_fail(cfd, s, "path too long");
-                return;
+/* v1.2: sync 字节流解析器。每收到一段客户端数据调用一次。
+ * DATA 帧负载不进缓冲、直接流写文件（sdata_remain 跟踪剩余字节数），
+ * 头缓冲只存帧头+路径（≤1039B）。该 adb 客户端会流水线连发多个
+ * 64KB WRTE（不等逐包确认），任何"整帧攒齐再落盘"的缓冲都会溢出。 */
+static void sync_input(int cfd, stream_t *s, const unsigned char *data, size_t len)
+{
+    size_t off = 0;
+    for (;;) {
+        if (s->sdata_remain > 0) {
+            /* DATA 帧负载：先排空 sbuf 里压着的，再吃本次数据 */
+            size_t n;
+            if (s->sfill > 0) {
+                n = s->sfill;
+                if (n > s->sdata_remain)
+                    n = s->sdata_remain;
+                if (write_all(s->sfd, s->sbuf, n) < 0) {
+                    sync_fail(cfd, s, "write failed");
+                    return;
+                }
+                s->sdata_remain -= n;
+                memmove(s->sbuf, s->sbuf + n, s->sfill - n);
+                s->sfill -= n;
             }
-            char path[1024];
-            memcpy(path, s->sbuf + 8, arg);
-            path[arg] = 0;
-            sync_consume(s, 8 + (size_t)arg);
-            struct stat st;
-            if (stat(path, &st) != 0) {
-                sync_fail(cfd, s, "stat failed");
-                return;
+            if (s->sdata_remain > 0 && off < len) {
+                n = len - off;
+                if (n > s->sdata_remain)
+                    n = s->sdata_remain;
+                if (write_all(s->sfd, data + off, n) < 0) {
+                    sync_fail(cfd, s, "write failed");
+                    return;
+                }
+                s->sdata_remain -= n;
+                off += n;
             }
-            unsigned char out[16];
-            unsigned m = (unsigned)st.st_mode, sz = (unsigned)st.st_size;
-            unsigned t = (unsigned)st.st_mtime;
-            memcpy(out, "STAT", 4);
-            memcpy(out + 4, &m, 4);
-            memcpy(out + 8, &sz, 4);
-            memcpy(out + 12, &t, 4);
-            if (wrte_stream(cfd, s, out, 16) < 0)
-                return;
-        } else if (!memcmp(id, "SEND", 4)) {
-            if (s->sfill < 8 + (size_t)arg)
-                return;
-            if (arg >= 1000) {
-                sync_fail(cfd, s, "path too long");
-                return;
+            if (s->sdata_remain > 0)
+                return;             /* 负载未到齐，等下一个 WRTE */
+            continue;
+        }
+        if (s->sneed == 0 && s->sfill >= 8) {
+            /* 有完整帧头：定本帧总长 */
+            char id[5];
+            unsigned arg;
+            memcpy(id, s->sbuf, 4);
+            id[4] = 0;
+            memcpy(&arg, s->sbuf + 4, 4);
+            if (!memcmp(id, "DATA", 4) || !memcmp(id, "DONE", 4) ||
+                !memcmp(id, "QUIT", 4)) {
+                s->sneed = 8;
+            } else {
+                if (arg >= 1024) {
+                    sync_fail(cfd, s, "path too long");
+                    return;
+                }
+                s->sneed = 8 + arg;
             }
-            char tmp[1025];
-            memcpy(tmp, s->sbuf + 8, arg);
-            tmp[arg] = 0;
-            sync_consume(s, 8 + (size_t)arg);
-            unsigned mode = 0100644;
-            char *comma = strchr(tmp, ',');
-            if (comma) {
-                *comma = 0;
-                mode = (unsigned)strtoul(comma + 1, NULL, 8);
-            }
-            snprintf(s->spath, sizeof(s->spath), "%s", tmp);
-            s->sfd = open(s->spath, O_WRONLY | O_CREAT | O_TRUNC,
-                          (mode_t)(mode & 0777));
-            if (s->sfd < 0) {
-                sync_fail(cfd, s, "cannot open local file");
-                return;
-            }
-            s->sstate = 1;
-            if (g_verbose)
-                logmsg("sync SEND -> %s", s->spath);
-        } else if (!memcmp(id, "DATA", 4)) {
-            if (s->sfill < 8 + (size_t)arg)
-                return;
-            if (s->sstate != 1 || s->sfd < 0) {
-                sync_fail(cfd, s, "DATA outside SEND");
-                return;
-            }
-            if (write_all(s->sfd, s->sbuf + 8, arg) < 0) {
-                sync_fail(cfd, s, "write failed");
-                return;
-            }
-            sync_consume(s, 8 + (size_t)arg);
-        } else if (!memcmp(id, "DONE", 4)) {
-            if (s->sfill < 8)
-                return;
-            unsigned mt;
-            memcpy(&mt, s->sbuf + 4, 4);
-            sync_consume(s, 8);
-            if (s->sstate == 1 && s->sfd >= 0) {
-                close(s->sfd);
-                s->sfd = -1;
-                struct timespec ts[2];
-                ts[0].tv_sec = 0;
-                ts[0].tv_nsec = UTIME_OMIT;
-                ts[1].tv_sec = (time_t)mt;
-                ts[1].tv_nsec = 0;
-                utimensat(AT_FDCWD, s->spath, ts, 0);
-                s->sstate = 0;
+        }
+        if (s->sfill < s->sneed || (s->sneed == 0 && s->sfill < 8)) {
+            /* 攒字节（含首次攒 8 字节帧头——sneed 未定时也要攒，否则永远进不了帧解析） */
+            size_t n = len - off;
+            if (n > sizeof(s->sbuf) - s->sfill)
+                n = sizeof(s->sbuf) - s->sfill;
+            if (n == 0)
+                return;             /* 本次数据用尽且帧未齐 */
+            memcpy(s->sbuf + s->sfill, data + off, n);
+            s->sfill += n;
+            off += n;
+            continue;
+        }
+        /* 帧已齐：分发 */
+        {
+            char id[5];
+            unsigned arg;
+            memcpy(id, s->sbuf, 4);
+            id[4] = 0;
+            memcpy(&arg, s->sbuf + 4, 4);
+
+            if (!memcmp(id, "STAT", 4)) {
+                char path[1025];
+                memcpy(path, s->sbuf + 8, arg);
+                path[arg] = 0;
+                sync_consume(s, s->sneed);
+                s->sneed = 0;
+                /* stat 失败也回 STAT+全零（真实 adbd 行为），客户端据此判定
+                 * "远端不存在"并继续 push；回 FAIL 会让客户端报
+                 * "stat response has wrong message id" 直接中止。 */
+                struct stat st;
+                unsigned m = 0, sz = 0, t = 0;
+                if (stat(path, &st) == 0) {
+                    m = (unsigned)st.st_mode;
+                    sz = (unsigned)st.st_size;
+                    t = (unsigned)st.st_mtime;
+                }
+                unsigned char out[16];
+                memcpy(out, "STAT", 4);
+                memcpy(out + 4, &m, 4);
+                memcpy(out + 8, &sz, 4);
+                memcpy(out + 12, &t, 4);
+                if (wrte_stream(cfd, s, out, 16) < 0)
+                    return;
+            } else if (!memcmp(id, "SEND", 4)) {
+                char path[1025];
+                memcpy(path, s->sbuf + 8, arg);
+                path[arg] = 0;
+                sync_consume(s, s->sneed);
+                s->sneed = 0;
+                unsigned mode = 0100644;
+                char *comma = strchr(path, ',');
+                if (comma) {
+                    *comma = 0;
+                    mode = (unsigned)strtoul(comma + 1, NULL, 8);
+                }
+                snprintf(s->spath, sizeof(s->spath), "%s", path);
+                /* v1.2: 真实 adbd 的 secure_mkdirs——SEND 自动创建缺失的父目录。
+                 * `adb push <目录> <目标>` 时客户端按 目标/子目录/文件 发 SEND，
+                 * 没有这一步目录 push 必失败（文件本身由 open(O_CREAT) 创建）。 */
+                {
+                    char *p;
+                    for (p = s->spath + 1; (p = strchr(p, '/')) != NULL; p++) {
+                        *p = 0;
+                        mkdir(s->spath, 0755);   /* 已存在时静默忽略 */
+                        *p = '/';
+                    }
+                }
+                s->sfd = open(s->spath, O_WRONLY | O_CREAT | O_TRUNC,
+                              (mode_t)(mode & 0777));
+                if (s->sfd < 0) {
+                    sync_fail(cfd, s, "cannot open local file");
+                    return;
+                }
+                s->sstate = 1;
+                s->sdata_remain = 0;
                 if (g_verbose)
-                    logmsg("sync SEND done: %s", s->spath);
+                    logmsg("sync SEND -> %s", s->spath);
+            } else if (!memcmp(id, "DATA", 4)) {
+                sync_consume(s, 8);
+                s->sneed = 0;
+                if (s->sstate != 1 || s->sfd < 0) {
+                    sync_fail(cfd, s, "DATA outside SEND");
+                    return;
+                }
+                s->sdata_remain = arg;
+            } else if (!memcmp(id, "DONE", 4)) {
+                sync_consume(s, 8);
+                s->sneed = 0;
+                if (s->sstate == 1 && s->sfd >= 0) {
+                    close(s->sfd);
+                    s->sfd = -1;
+                    struct timespec ts[2];
+                    ts[0].tv_sec = 0;
+                    ts[0].tv_nsec = UTIME_OMIT;
+                    ts[1].tv_sec = (time_t)arg;
+                    ts[1].tv_nsec = 0;
+                    utimensat(AT_FDCWD, s->spath, ts, 0);
+                    if (g_verbose)
+                        logmsg("sync SEND done: %s", s->spath);
+                }
+                unsigned char ok[8];
+                memcpy(ok, "OKAY", 4);
+                unsigned zero = 0;
+                memcpy(ok + 4, &zero, 4);
+                /* 必须发足 8 字节（id+size）：客户端读完整应答头，只发 4 字节
+                 * 会让它在 DONE 后永远等最后 4 字节（push 完成后不退出）。 */
+                if (wrte_stream(cfd, s, ok, 8) < 0)
+                    return;
+            } else if (!memcmp(id, "RECV", 4)) {
+                char path[1025];
+                memcpy(path, s->sbuf + 8, arg);
+                path[arg] = 0;
+                sync_consume(s, s->sneed);
+                s->sneed = 0;
+                s->sfd = open(path, O_RDONLY);
+                if (s->sfd < 0) {
+                    sync_fail(cfd, s, "cannot open local file");
+                    return;
+                }
+                snprintf(s->spath, sizeof(s->spath), "%s", path);
+                s->sstate = 2;
+                if (g_verbose)
+                    logmsg("sync RECV <- %s", path);
+                sync_pump(cfd, s);
+            } else if (!memcmp(id, "LIST", 4)) {
+                char path[1025];
+                memcpy(path, s->sbuf + 8, arg);
+                path[arg] = 0;
+                sync_consume(s, s->sneed);
+                s->sneed = 0;
+                s->dirp = opendir(path);
+                if (!s->dirp) {
+                    sync_fail(cfd, s, "opendir failed");
+                    return;
+                }
+                snprintf(s->spath, sizeof(s->spath), "%s", path);
+                s->sstate = 3;
+                if (g_verbose)
+                    logmsg("sync LIST %s", path);
+                sync_pump(cfd, s);
+            } else if (!memcmp(id, "QUIT", 4)) {
+                sync_consume(s, 8);
+                s->sneed = 0;
+                send_msg(cfd, A_CLSE, s->local_id, s->remote_id, NULL, 0);
+                stream_close(s);
+                return;
+            } else {
+                sync_fail(cfd, s, "unknown sync command");
+                return;
             }
-            unsigned char ok[8];
-            memcpy(ok, "OKAY", 4);
-            unsigned zero = 0;
-            memcpy(ok + 4, &zero, 4);
-            if (wrte_stream(cfd, s, ok, 4) < 0)
-                return;
-        } else if (!memcmp(id, "RECV", 4)) {
-            if (s->sfill < 8 + (size_t)arg)
-                return;
-            if (arg >= sizeof(s->spath)) {
-                sync_fail(cfd, s, "path too long");
-                return;
-            }
-            char path[1024];
-            memcpy(path, s->sbuf + 8, arg);
-            path[arg] = 0;
-            sync_consume(s, 8 + (size_t)arg);
-            s->sfd = open(path, O_RDONLY);
-            if (s->sfd < 0) {
-                sync_fail(cfd, s, "cannot open local file");
-                return;
-            }
-            snprintf(s->spath, sizeof(s->spath), "%s", path);
-            s->sstate = 2;
-            if (g_verbose)
-                logmsg("sync RECV <- %s", path);
-        } else if (!memcmp(id, "LIST", 4)) {
-            if (s->sfill < 8 + (size_t)arg)
-                return;
-            if (arg >= sizeof(s->spath)) {
-                sync_fail(cfd, s, "path too long");
-                return;
-            }
-            char path[1024];
-            memcpy(path, s->sbuf + 8, arg);
-            path[arg] = 0;
-            sync_consume(s, 8 + (size_t)arg);
-            s->dirp = opendir(path);
-            if (!s->dirp) {
-                sync_fail(cfd, s, "opendir failed");
-                return;
-            }
-            snprintf(s->spath, sizeof(s->spath), "%s", path);
-            s->sstate = 3;
-            if (g_verbose)
-                logmsg("sync LIST %s", path);
-        } else if (!memcmp(id, "QUIT", 4)) {
-            sync_consume(s, 8);
-            send_msg(cfd, A_CLSE, s->local_id, s->remote_id, NULL, 0);
-            stream_close(s);
-            return;
-        } else {
-            sync_fail(cfd, s, "unknown sync command");
-            return;
         }
     }
 }
@@ -439,12 +583,15 @@ static void sync_pump(int cfd, stream_t *s)
             wrte_stream(cfd, s, out, (size_t)8 + (size_t)n);
             return;
         }
+        /* v1.2: 文件读完只回 DONE、不关流——目录 pull 会在同一条 sync 流上
+         * 继续 RECV 下一个文件（真实 adbd 如此）；收尾由客户端 QUIT/CLSE 完成。 */
+        close(s->sfd);
+        s->sfd = -1;
+        s->sstate = 0;
         memcpy(out, "DONE", 4);
         unsigned zero = 0;
         memcpy(out + 4, &zero, 4);
         wrte_stream(cfd, s, out, 8);
-        send_msg(cfd, A_CLSE, s->local_id, s->remote_id, NULL, 0);
-        stream_close(s);
         return;
     }
 
@@ -459,7 +606,7 @@ static void sync_pump(int cfd, stream_t *s)
             size_t nl = strlen(ent->d_name);
             if (fill + 20 + nl > MAXPAYLOAD)
                 break;
-            char full[1100];
+            char full[1350];   /* spath(1023) + '/' + d_name(255)，v1.2 加固 */
             snprintf(full, sizeof(full), "%s/%s", s->spath, ent->d_name);
             struct stat st;
             unsigned m = 0, sz = 0, t = 0;
@@ -484,18 +631,18 @@ static void sync_pump(int cfd, stream_t *s)
         closedir(s->dirp);
         s->dirp = NULL;
         s->sstate = 0;
-        unsigned char done[8];
+        /* v1.2: LIST 结束符必须 20 字节（DONE+4 个零字段）：客户端在 LIST 循环里
+         * 按完整 DENT 头(20B)读每一帧，8 字节 DONE 会让它永远等剩下 12 字节。
+         * 流保持打开，客户端随后在同一条流上逐个 RECV 文件，收尾靠 QUIT/CLSE。 */
+        unsigned char done[20];
+        memset(done, 0, sizeof(done));
         memcpy(done, "DONE", 4);
-        unsigned zero = 0;
-        memcpy(done + 4, &zero, 4);
-        wrte_stream(cfd, s, done, 8);
-        send_msg(cfd, A_CLSE, s->local_id, s->remote_id, NULL, 0);
-        stream_close(s);
+        wrte_stream(cfd, s, done, 20);
     }
 }
 
 /* ---------- per-connection ---------- */
-static unsigned char g_in[64 * 1024];
+static unsigned char g_in[128 * 1024];   /* v1.2: 客户端最大可发 64KB 包，留双倍余量 */
 static size_t g_infill = 0;
 static char g_dest[MAXCMD + 1];
 
@@ -508,7 +655,7 @@ static void handle_client(int cfd)
      * 让 adb 客户端走我们真正实现的 v1 sync / legacy shell。 */
     char banner[32];
     snprintf(banner, sizeof(banner), "device::");
-    if (send_msg(cfd, A_CNXN, PROTO_VERSION, MAXPAYLOAD, banner, strlen(banner)) < 0)
+    if (send_msg(cfd, A_CNXN, PROTO_VERSION, MAXPAYLOAD_IO, banner, strlen(banner)) < 0)
         return;
 
     for (;;) {
@@ -536,25 +683,33 @@ static void handle_client(int cfd)
             return;
         }
 
-        /* child produced output -> WRTE to client (paced by await_ok) */
+        /* child produced output -> WRTE to client (paced by await_ok).
+         * v1.2 修复：必须先判 await_ok 再 read()。旧代码先读后判，把已读
+         * 出来的数据直接丢弃——快速输出的第二块起被随机截断。数据留在
+         * 管道里（默认 64KB 容量足够客户端 ACK 往返），等 OKAY 到达再读。 */
         for (i = 1; i < n; i++) {
-            if (!(p[i].revents & (POLLIN | POLLHUP)))
-                continue;
             if (mapping[i] < 0)
                 continue;
+            if (!(p[i].revents & (POLLIN | POLLHUP)))
+                continue;
             stream_t *s = &g_s[mapping[i]];
+            if (s->await_ok)
+                continue;   /* 未确认前绝不读，避免读出后丢弃 */
             char buf[MAXPAYLOAD];
             ssize_t got = read(s->from_child, buf, sizeof(buf));
-            if (got < 0 && errno == EAGAIN)
-                continue;
+            if (got < 0) {
+                if (errno == EAGAIN)
+                    continue;
+                logmsg("child read err fd=%d errno=%d", s->from_child, errno);
+                continue;   /* 非 EAGAIN 错误不当作 EOF */
+            }
             if (got > 0) {
-                if (s->await_ok)
-                    continue;   /* 等客户端 OKAY，数据暂留管道 */
                 if (wrte_stream(cfd, s, buf, (size_t)got) < 0)
                     return;
                 continue;
             }
             /* EOF */
+            logmsg("child EOF pid=%d", (int)s->pid);
             if (s->pid > 0) {
                 int st;
                 waitpid(s->pid, &st, 0);
@@ -651,9 +806,14 @@ static void handle_client(int cfd)
                     }
                 }
             } else if (cmd == A_WRTE) {
+                /* v1.2 修复：客户端发来的包里 a0 恒为发送方自己的流 id，
+                 * 我们这一侧的流 id 在 a1。旧代码按 a0 匹配，双方流号一旦
+                 * 不同步（adb server 流号漂移后如 47），所有客户端 WRTE
+                 * 都找不到流：sync 帧被丢弃=push 挂死，stdin 数据进不了
+                 * 子进程。与 OKAY/CLSE 处理一致，改按 a1 匹配。 */
                 int found = 0;
                 for (i = 0; i < MAX_STREAMS; i++) {
-                    if (g_s[i].active && g_s[i].local_id == a0) {
+                    if (g_s[i].active && g_s[i].local_id == a1) {
                         found = 1;
                         /* 先确认，客户端才会继续发 */
                         send_msg(cfd, A_OKAY, a1, a0, NULL, 0);
@@ -662,13 +822,7 @@ static void handle_client(int cfd)
                                 write_all(g_s[i].to_child, payload, dlen) < 0)
                                 stream_close(&g_s[i]);
                         } else if (g_s[i].kind == 1) {
-                            if (g_s[i].sfill + dlen <= sizeof(g_s[i].sbuf)) {
-                                memcpy(g_s[i].sbuf + g_s[i].sfill, payload, dlen);
-                                g_s[i].sfill += dlen;
-                                sync_process(cfd, &g_s[i]);
-                            } else {
-                                sync_fail(cfd, &g_s[i], "sync buffer overflow");
-                            }
+                            sync_input(cfd, &g_s[i], payload, dlen);
                         }
                         break;
                     }
@@ -676,10 +830,11 @@ static void handle_client(int cfd)
                 if (!found)
                     send_msg(cfd, A_OKAY, a1, a0, NULL, 0);
             } else if (cmd == A_OKAY) {
-                /* 客户端确认了我们的 WRTE -> 解锁下一包 */
+                /* 客户端确认了我们的 WRTE -> 解锁并冲刷待发队列 */
                 for (i = 0; i < MAX_STREAMS; i++) {
                     if (g_s[i].active && g_s[i].local_id == a1) {
                         g_s[i].await_ok = 0;
+                        wrte_flush(cfd, &g_s[i]);
                         break;
                     }
                 }
@@ -724,13 +879,13 @@ int main(int argc, char **argv)
 {
     int i;
     signal(SIGCHLD, SIG_IGN);
-    signal(SIGPIPE, SIG_DFL);
+    signal(SIGPIPE, SIG_IGN);   /* v1.2: EPIPE 由 write_all 返回 -1 处理；默认行为会杀死整个连接处理进程 */
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-l") && i + 1 < argc) g_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-q")) g_verbose = 0;
         else if (!strcmp(argv[i], "-h")) {
-            fprintf(stderr, "adbxd v1.1 - minimal adb daemon over TCP\n"
+            fprintf(stderr, "adbxd v1.2 - minimal adb daemon over TCP\n"
                             "  -l <port>  listen port (default 5555)\n"
                             "  -q         quiet\n"
                             "  services: shell exec cmd sync(v1 push/pull)\n");
@@ -752,7 +907,7 @@ int main(int argc, char **argv)
         logmsg("cannot listen on %d: %s", g_port, strerror(errno));
         return 1;
     }
-    logmsg("adbxd v1.1 ready on 0.0.0.0:%d (shell/exec/cmd/sync)", g_port);
+        logmsg("adbxd v1.2 ready on 0.0.0.0:%d (shell/exec/cmd/sync)", g_port);
 
     for (;;) {
         struct sockaddr_in peer;

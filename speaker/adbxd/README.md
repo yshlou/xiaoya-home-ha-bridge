@@ -3,17 +3,29 @@
 给这台 RK3308 / Buildroot 音箱补上**网络调试**：装好后无需 USB 线，
 `adb connect <音箱IP>:5555` 即是 **root shell**。
 
-**v1.1（2026-10-31）**：修复三个生产环境实测缺陷——
+**v1.2（2026-11-01）**：v1.1 部署后暴露的新缺陷全部修复，`adb push / pull`
+（含目录双向）在真实 adb 1.0.41 客户端下字节级验证通过——
 
-1. **长命令截断**：OPEN 目标串缓冲只有 512 字节，超过 511 字符的 shell 命令被静默砍断
-   （甚至可能把引号腰斩，`sh -c` 报 unterminated quoted string）。现扩到 64KB。
-2. **adb push/pull 不可用**：`sync:` 服务未实现，OPEN 被回 OKAY+CLSE，客户端报
-   `protocol fault: failed to read stat response`；且特性串谎报 stat_v2/sendrecv_v2
-   等特性诱导客户端用 v2 帧。现实现完整 **sync v1**（STAT/SEND/RECV/LIST/QUIT），
-   特性串改为不报任何 v2，客户端自动回退 v1。
-3. **stdin 转发挂死**：WRTE 的确认帧 OKAY(a0,a1) 参数写反（把客户端的 a0/a1 原样回），
-   adb 客户端无法解析确认，`adb shell cmd < file` 永远卡死；同时自身发 WRTE 从不等
-   OKAY（无流控）。现已修正交换并加每流 await_ok 流控。
+1. **快速输出随机截断**：子进程输出循环"先 read 再判 await_ok"，已读出但未确认的
+   数据被直接丢弃（`echo a; echo b; cat f` 只出第一块）。改为先判再读，数据留管道。
+2. **push 挂死 / stdin 丢数据**：客户端→设备 WRTE 里设备侧流号在 `a1`（`a0` 恒为
+   发送方自己的 id），旧代码按 `a0` 匹配——双方流号同步时碰巧可用，adb server 流号
+   漂移后（实测 47、403）所有客户端 WRTE 被丢。改按 `a1` 匹配。
+3. **SIGPIPE 杀进程**：向已退出子进程写 stdin 会杀死整个连接处理进程。改为 SIG_IGN。
+4. **CNXN max_data=4096**：客户端直接拒发长命令（`shell command too long`），
+   64KB 命令缓冲形同虚设。改报 64KB，接收缓冲扩到 128KB。
+5. **流式 sync 解析器**：DATA 帧负载直写磁盘，不再整帧缓冲——该客户端会流水线
+   连发多个 64KB WRTE（不等逐包确认），固定缓冲必溢出（200KB push 实测翻车）。
+6. **STAT 不存在路径回 FAIL** → 改回 STAT+全零（真实 adbd 行为；FAIL 会让客户端
+   报 `stat response has wrong message id` 中止）。
+7. **SEND/DONE 应答只发 4 字节** → 8 字节（客户端读完整 id+size 头，缺 4 字节
+   会让 push 完成后客户端永不退出）。
+8. **LIST 结束符 8 字节** → 20 字节（客户端按完整 DENT 头 20B 读帧，8 字节 DONE
+   让递归 pull 永远等剩余 12 字节）；LIST/RECV 结束后不再关流（目录 pull 在同一
+   sync 流上连续 RECV 多个文件）。
+9. **secure_mkdirs**：SEND 自动创建缺失父目录（`adb push <目录> <目标>` 必需）。
+10. **每流待发队列**：客户端流水线化导致我方上一包未 ack 时新回复到达——静默丢弃
+    会让多文件目录 push 卡死。未确认时排队，OKAY 到达后按序冲刷。
 
 ## 为什么不能用原生 adbd
 
@@ -29,6 +41,8 @@
    `ADB_LOCAL_TRANSPORT_PORT=5555 adbd`、先断 UDC 再启 adbd。
 4. adbd 确实在 **127.0.0.1:5037** 开了监听（inode 与 adbd 的 fd 一致），
    但它**不是可用的客户端传输口**：转发过去后一发 CNXN 就被断开。
+5. 这台设备的原生 adbd 连 USB 通道的 sync 服务也被裁剪（push/pull 同样报
+   protocol fault），所以 adbxd 是这台设备**唯一**可用的 push/pull 通道。
 
 结论：**必须自己说 ADB 协议**，`adbxd.c` 就是这么做的。
 
@@ -36,8 +50,8 @@
 
 | 文件 | 说明 |
 |---|---|
-| `adbxd.c` | 网络 adb 守护进程源码（aarch64 musl 静态，47KB） |
-| `adbxd` / `adbxd.aarch64-static` | 编译好的二进制（同一份） |
+| `adbxd.c` | 网络 adb 守护进程源码（aarch64 musl 静态，69KB） |
+| `adbxd` / `adbxd.aarch64-static` | 编译好的二进制（同一份，v1.2） |
 | `adbnetd.c` | 早期尝试的纯转发方案（转 5555→127.0.0.1:5037），已证明不可行，留作记录 |
 | `probe.py` | 原始 ADB 协议探针，用于握手排障 |
 
@@ -49,9 +63,9 @@ zig cc -target aarch64-linux-musl -O2 -static -s -o adbxd adbxd.c
 
 本机若无 zig：`python -m pip install ziglang==0.13.0`（PyPI 被限时用阿里云镜像
 `-i https://mirrors.aliyun.com/pypi/simple`，速度约 4MB/s），
-之后 `python -m ziglang cc ...` 亦可。v1.1 起 `adb push / pull` 已可用；
+之后 `python -m ziglang cc ...` 亦可。v1.2 起 `adb push / pull` 已可用；
 若手头还是旧版二进制，传文件用「PC 起 `python -m http.server` + 音箱 `wget -O`」
-或另一台能 USB 直连的电脑。
+或纯 hex 分块 `printf '\x..'` 追加（无引号转义问题，约 68KB/6 秒）。
 
 ## 部署
 
@@ -74,14 +88,18 @@ adb -s 192.168.0.185:5555 shell id      :: uid=0(root)
 -q         静默（默认打印协议日志，排障时很有用）
 ```
 
-## 已支持 / 未支持
+## 已支持 / 已知限制
 
 - ✅ `adb shell <cmd>`、`adb shell`（交互式，无 PTY，所以 `vi`/`top` 这类要 tty 的程序不像）
-- ✅ `adb push` / `adb pull` / 目录 LIST（sync v1；STAT/SEND/RECV/LIST/QUIT 全套，
-  带每流 OKAY 流控，DONE 后恢复文件 mtime）
-- ✅ `adb shell cmd < file`（stdin 转发 + 正确的 WRTE 确认交换）
-- ✅ root 权限（本身就是 root 子进程）
-- ✅ 多个并发连接；已验证 adb 1.0.41 与老 adb(v36) 客户端均可用
+- ✅ `adb push` / `adb pull` 单文件（含 200KB+ 大文件，字节级校验通过）
+- ✅ `adb push <目录>` / `adb pull <目录>` 递归双向（自动建父目录）
+- ✅ `adb shell cmd < file` stdin 数据转发（内容完整落盘）
+- ✅ `adb exec-out`、`adb shell` 长命令（≤ 客户端 4096 限制，见下）
+- ✅ root 权限（本身就是 root 子进程）、多并发连接、adb server 流号漂移免疫
+- ⚠️ **超 4096 字符的 shell 命令**被 adb 客户端自身拒绝（`shell command too long`，
+  客户端硬限制，与设备端 64KB 缓冲无关；实测 4000 过、4200 拒）
+- ⚠️ **stdin-EOF 无信号**：legacy shell 协议（无 shell_v2）下 `adb shell cmd < file`
+  数据全部到达，但客户端要等超时/手动杀才退出（老协议固有，真机老 adbd 同样如此）
 - ❌ v2 sync / shell_v2 / abb（故意不报这些特性，客户端自动走 v1）
 - ❌ PTY、端口转发（需要再说）
 
